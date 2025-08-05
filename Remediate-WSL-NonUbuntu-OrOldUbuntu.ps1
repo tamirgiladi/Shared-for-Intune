@@ -1,102 +1,56 @@
-﻿param([string]$MinVersion = '22.04')
+# ⚠️ מסיר בפועל (unregister) כל דיסטרו שאינו Ubuntu ≥ 22.04.
+# הפעולה מוחקת לצמיתות את קבצי הדיסטרו (rootfs והמשתמשים שבתוכו).
+# הרץ בהקשר המשתמש (Logged-on credentials = Yes) כדי להסיר את האינסטנסים של המשתמש.
 
-$min = [version]$MinVersion
-$IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
-).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
+$ErrorActionPreference = 'SilentlyContinue'
+$min = [version]'22.04'
+$toRemove = @()
 
-function Get-NonCompliantDistroNames {
-  $list = & wsl.exe -l -q 2>$null
-  if (-not $list) { return @() }
+# אסוף דיסטרואים להסרה
+wsl.exe -l -q |
+  ForEach-Object {
+    $name = $_.ToString()
+    $name = $name -replace '^\*',''                 # הסר כוכבית ברירת מחדל
+    $name = [regex]::Replace($name, '\p{C}', '')    # נקה תווי בקרה/כיוון נסתרים
+    $name = $name.Trim()
+    if (-not $name) { return }
 
-  $list |
-    ForEach-Object { $_.ToString() } |
-    ForEach-Object { [regex]::Replace($_, '\p{C}', '') } | # נקה תווי בקרה/כיוון
-    ForEach-Object { $_.Trim() } |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-    ForEach-Object {
-      $n = $_ -replace '^\*',''
-      if ($n -like 'Ubuntu-*') {
-        $num = $n -replace '^Ubuntu-',''
-        try { $v = [version]$num } catch { $v = [version]'0.0' }
-        if ($v -lt $min) { $n }
-      } else {
-        $n
-      }
-    } | Sort-Object -Unique
-}
-
-function Try-Unregister([string]$Name) {
-  if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
-  Write-Host "WSL: Unregister '$Name'..."
-  Start-Process wsl.exe -ArgumentList @('--terminate', $Name) -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
-  $p = Start-Process wsl.exe -ArgumentList @('--unregister', $Name) -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
-  return ($p.ExitCode -eq 0)
-}
-
-function Force-UnregisterByRegistry([string]$Name) {
-  if ([string]::IsNullOrWhiteSpace($Name)) { return }
-  Write-Host "WSL: Force-unregister (Registry) '$Name'..."
-  wsl.exe --shutdown | Out-Null
-  $lxss = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
-  if (Test-Path $lxss) {
-    Get-ChildItem $lxss -ErrorAction SilentlyContinue | ForEach-Object {
-      $p = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
-      if ($p.DistributionName -eq $Name) {
-        $base = $p.BasePath
-        Remove-Item -LiteralPath $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
-        if ($base) { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
-        Write-Host "Removed registry + base path for '$Name'."
-      }
+    if ($name -match '^Ubuntu(?:[^\d]*)(\d+)\.(\d+)$') {
+      $ver = [version]::new([int]$Matches[1], [int]$Matches[2])
+      if ($ver -lt $min) { $toRemove += $name }
+    }
+    elseif ($name -like 'Ubuntu*') {
+      # Ubuntu בלי מספר גרסה → הסר
+      $toRemove += $name
+    }
+    else {
+      # כל מה שאינו Ubuntu
+      $toRemove += $name
     }
   }
+
+$toRemove = $toRemove | Sort-Object -Unique
+
+# נסה להסיר
+$removed = @()
+$failed  = @()
+
+foreach ($name in $toRemove) {
+  Write-Host "Unregistering '$name'..."
+  & wsl.exe --terminate "$name" 2>$null
+  & wsl.exe --unregister "$name"
+  if ($LASTEXITCODE -eq 0) {
+    Write-Host "OK: '$name' הוסר."
+    $removed += $name
+  } else {
+    Write-Warning "נכשל להסיר '$name' (ExitCode=$LASTEXITCODE)."
+    $failed += $name
+  }
 }
 
-# --- שלב 1: הסרת אינסטנסים לא תואמים ---
-$toRemove = Get-NonCompliantDistroNames
-foreach ($n in $toRemove) {
-  if (-not (Try-Unregister -Name $n)) {
-    Force-UnregisterByRegistry -Name $n
-  }
-}
+# סיכום ללוג
+if ($removed.Count) { Write-Host "Removed: $($removed -join ', ')" }
+if ($failed.Count)  { Write-Warning "Failed:  $($failed  -join ', ')" }
 
-# --- שלב 2–3: הסרת חבילות Store ישנות וניקוי (Admin בלבד) ---
-if ($IsAdmin) {
-  # הסרת חבילות Ubuntu ישנות לכל המשתמשים
-  $appxAll = Get-AppxPackage -AllUsers | Where-Object {
-    $_.Name -like 'CanonicalGroupLimited.Ubuntu*' -and
-    ($_.Name -match 'Ubuntu(\d+(?:\.\d+)+)') -and
-    ([version]$Matches[1] -lt $min)
-  }
-  foreach ($p in $appxAll) {
-    Write-Host "Store: Remove-AppxPackage (AllUsers) '$($p.Name)'..."
-    try { Remove-AppxPackage -AllUsers -Package $p.PackageFullName -ErrorAction Stop } catch { Write-Warning $_ }
-  }
-
-  # הסרה מ-Provisioned (שלא יופיע למשתמשים חדשים)
-  $prov = Get-AppxProvisionedPackage -Online | Where-Object {
-    $_.DisplayName -like 'CanonicalGroupLimited.Ubuntu*' -and
-    ($_.DisplayName -match 'Ubuntu(\d+(?:\.\d+)+)') -and
-    ([version]$Matches[1] -lt $min)
-  }
-  foreach ($pp in $prov) {
-    Write-Host "Store: Remove-AppxProvisionedPackage '$($pp.DisplayName)'..."
-    try { Remove-AppxProvisionedPackage -Online -PackageName $pp.PackageName -ErrorAction Stop } catch { Write-Warning $_ }
-  }
-
-  # ניקוי תיקיות LocalState של Ubuntu ישנות
-  $pkgRoot = Join-Path $env:LOCALAPPDATA 'Packages'
-  if (Test-Path $pkgRoot) {
-    Get-ChildItem $pkgRoot -Directory -ErrorAction SilentlyContinue |
-      Where-Object { $_.Name -like 'CanonicalGroupLimited.Ubuntu*' } |
-      ForEach-Object {
-        if ($_.Name -match 'Ubuntu(\d+(?:\.\d+)+)' -and ([version]$Matches[1] -lt $min)) {
-          Write-Host "Cleanup: $($_.FullName)"
-          Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-        }
-      }
-  }
-} else {
-  Write-Host "הרץ כ-Administrator כדי להסיר גם את חבילות ה-Store הישנות (18.04/20.04)."
-}
-
-Write-Host 'Done. סגור ופתח מחדש את Windows Terminal.'
+# ל-Proactive Remediations לא נדרש קוד יציאה מיוחד; משאירים 0.
+exit 0
