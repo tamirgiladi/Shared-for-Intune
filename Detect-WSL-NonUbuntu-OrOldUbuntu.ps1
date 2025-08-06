@@ -1,57 +1,89 @@
-# Detection – מדלג אם אין WSL/אין דיסטרואים, או אם כולם Installing/Uninstalling.
-# מחזיר Exit 1 רק כשנמצאו דיסטראות לא-תואמים בפועל.
-
+# Detection – Exit 1 רק כשנמצאו לא-תואמים; מדלג בשקט אם אין WSL/אין דיסטראות.
 $ErrorActionPreference = 'SilentlyContinue'
 $min = [version]'22.04'
 $bad = @()
 
-function Get-StableWslNames {
-  # נסה קודם -q (שמות בלבד)
-  $q = & wsl.exe -l -q 2>$null
-  if ($q) {
-    return $q |
-      ForEach-Object { [regex]::Replace($_, '\p{C}', '') } |
-      ForEach-Object { $_.Trim() } |
-      Where-Object { $_ } |
-      ForEach-Object { $_ -replace '^\*','' } |
-      Sort-Object -Unique
-  }
-
-  # נפילה ל- -v: פרסר שם/סטטוס; דלג על Installing/Uninstalling
-  $v = & wsl.exe -l -v 2>$null
-  if (-not $v) { return @() }
-
-  $names = @()
-  $v | Select-Object -Skip 1 | ForEach-Object {
-    $line = [regex]::Replace($_.ToString(), '\p{C}', '')
-    $line = $line.Trim()
-    if (-not $line) { return }
-    if ($line.StartsWith('*')) { $line = $line.Substring(1).Trim() }
-    $parts = $line -split ' {2,}'  # NAME  STATE  VERSION
-    if ($parts.Count -lt 2) { return }
-    $name  = $parts[0]
-    $state = $parts[1]
-    if ($state -match '^(Installing|Uninstalling)$') { return }  # דלג על טרנזיינט
-    $names += $name
-  }
-  return ($names | Sort-Object -Unique)
+function Is-HelpLine([string]$s) {
+  return ($s -match '^\s*(Usage:|Options:|Examples:|--help|wsl --install|--list|--status)')
 }
 
-$names = Get-StableWslNames
+function Get-WslNames {
+  # נסה שיטה 1: quiet
+  $q = & wsl.exe --list --quiet 2>$null
+  if ($LASTEXITCODE -eq 0 -and $q) {
+    $names = @()
+    foreach ($l in $q) {
+      if (Is-HelpLine $l) { continue }
+      $n = ([regex]::Replace($l,'\p{C}','')).Trim() -replace '^\*',''
+      if ($n) { $names += $n }
+    }
+    if ($names.Count) { return ($names | Sort-Object -Unique) }
+  }
+
+  # שיטה 2: verbose (NAME  STATE  VERSION)
+  $v = & wsl.exe --list --verbose 2>$null
+  if ($LASTEXITCODE -eq 0 -and $v) {
+    $names = @()
+    $lines = $v | Select-Object -Skip 1
+    foreach ($l in $lines) {
+      $s = ([regex]::Replace($l,'\p{C}','')).Trim()
+      if (-not $s -or (Is-HelpLine $s)) { continue }
+      if ($s.StartsWith('*')) { $s = $s.Substring(1).Trim() }
+      $parts = $s -split ' {2,}'
+      if ($parts.Count -ge 1) {
+        $state = ($parts | Select-Object -Skip 1 | Select-Object -First 1)
+        if ($state -match '^(Installing|Uninstalling)$') { continue } # דלג על טרנזיינט
+        $names += $parts[0]
+      }
+    }
+    if ($names.Count) { return ($names | Sort-Object -Unique) }
+  }
+
+  # שיטה 3: list רגיל
+  $l1 = & wsl.exe --list 2>$null
+  if ($LASTEXITCODE -eq 0 -and $l1) {
+    $names = @()
+    foreach ($l in $l1) {
+      if (Is-HelpLine $l) { continue }
+      $n = ([regex]::Replace($l,'\p{C}','')).Trim() -replace '^\*',''
+      if ($n -and $n -notmatch '^(NAME|Windows Subsystem)') { $names += $n }
+    }
+    if ($names.Count) { return ($names | Sort-Object -Unique) }
+  }
+
+  return @()
+}
+
+function Get-UbuntuVersionFromDistro([string]$dName) {
+  # מנסה לקרוא את /etc/os-release מתוך הדיסטורו (לשם 'Ubuntu' למשל)
+  $os = & wsl.exe -d $dName -- cat /etc/os-release 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $os) { return $null }
+  foreach ($line in $os) {
+    if ($line -match '^VERSION_ID="?(\d+(?:\.\d+)+)"?') {
+      try { return [version]$Matches[1] } catch { return $null }
+    }
+  }
+  return $null
+}
+
+$names = Get-WslNames
 if (-not $names -or $names.Count -eq 0) {
-  # אין WSL/אין דיסטרואים/הכול בתהליך התקנה/הסרה → אין מה לתקן
-  exit 0
+  exit 0  # אין WSL/אין דיסטראות/הכול בתהליך התקנה/הסרה → דלג
 }
 
-# בדיקת אי-תאימות
-$names | ForEach-Object {
-  $name = $_
+foreach ($name in $names) {
   if ($name -match '^Ubuntu[^\d]*(\d+(?:\.\d+)+)$') {
     try { $ver = [version]$Matches[1] } catch { $ver = [version]'0.0' }
     if ($ver -lt $min) { $bad += "$name (גרסה $ver) לא עומד בתנאים" }
   }
-  elseif ($name -like 'Ubuntu*') {
-    $bad += "$name (גרסה לא ידועה) לא עומד בתנאים"
+  elseif ($name -ieq 'Ubuntu') {
+    $ver = Get-UbuntuVersionFromDistro -dName 'Ubuntu'
+    if ($ver -and $ver -ge $min) {
+      # תקין – אל תוסיף לרשימת הבעיות
+    } else {
+      $msg = if ($ver) { "(גרסה $ver)" } else { "(גרסה לא ידועה)" }
+      $bad += "$name $msg לא עומד בתנאים"
+    }
   }
   else {
     $bad += "$name אינו Ubuntu 22.04 ומעלה"
