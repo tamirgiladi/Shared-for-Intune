@@ -1,0 +1,191 @@
+param(
+  [string]$OutXlsx = ".\Intune_Apps_Assignments.xlsx"  # שנה נתיב אם תרצה
+)
+
+# -------- Helpers --------
+function Ensure-Connected {
+  try { $null = Get-MgContext -ErrorAction Stop } catch {
+    throw "Not connected to Graph. Run: Connect-MgGraph -Scopes `"DeviceManagementApps.Read.All`,`"Directory.Read.All`""
+  }
+}
+function Ensure-ImportExcel {
+  if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+    Install-Module ImportExcel -Scope CurrentUser -Force | Out-Null
+  }
+  Import-Module ImportExcel -ErrorAction Stop
+}
+function Get-AppPlatformFromType($t){
+  $t = $t -replace '^#?microsoft\.graph\.', ''
+  switch -Regex ($t) {
+    'win32LobApp|windowsMsi|microsoftStore(App|ForBusinessApp)|windowsUniversalAppX|officeSuiteApp|winGetApp|windowsWebApp|windowsMicrosoftEdgeApp' { 'Windows' }
+    'android'   { 'Android' }
+    'ios|iPad|iPhone|vpp' { 'iOS' }
+    'macOS'     { 'macOS' }
+    default     { 'Unknown' }
+  }
+}
+function Get-AppVersion($app){
+  foreach($n in 'displayVersion','packageVersion','productVersion','version','detailedVersion','shortVersion'){
+    if($app.PSObject.Properties.Name -contains $n){
+      $v=$app.$n; if($v){ return $v }
+    }
+  }
+  return $null
+}
+
+# -------- Main --------
+Ensure-Connected
+Ensure-ImportExcel
+
+$base = "https://graph.microsoft.com/beta"
+
+# 1) Assignment Filters (לשם פילטר בדוח)
+$filterMap = @{}
+try {
+  $furl = "$base/deviceAppManagement/assignmentFilters"
+  while($furl){
+    $fp = Invoke-MgGraphRequest -Method GET -Uri $furl
+    foreach($f in ($fp.value ?? @())){ $filterMap[$f.id] = $f.displayName }
+    $furl = $fp.'@odata.nextLink'
+  }
+} catch { }
+
+# 2) כל האפליקציות (עם פגינציה)
+Write-Host "[INFO] Fetching Intune mobile apps..."
+$apps = @()
+$url = "$base/deviceAppManagement/mobileApps"
+while($url){
+  $p = Invoke-MgGraphRequest -Method GET -Uri $url
+  $apps += $p.value
+  $url = $p.'@odata.nextLink'
+}
+Write-Host ("[INFO] Total apps: {0}" -f $apps.Count)
+
+# 3) הקצאות פר אפליקציה (עם פגינציה)
+$rows     = New-Object System.Collections.Generic.List[object]
+Remove-Variable groupIds -ErrorAction SilentlyContinue
+$groupIds = [System.Collections.Generic.HashSet[string]]::new()
+
+foreach($app in $apps){
+  $assigns = @()
+  $aUrl = "$base/deviceAppManagement/mobileApps/$($app.id)/assignments"
+  while($aUrl){
+    $pg = Invoke-MgGraphRequest -Method GET -Uri $aUrl
+    $assigns += $pg.value
+    $aUrl = $pg.'@odata.nextLink'
+  }
+  if(-not $assigns){ continue }
+
+  $AppPlatform = Get-AppPlatformFromType ($app.'@odata.type')
+  $AppType     = ($app.'@odata.type' -replace '^#?microsoft\.graph\.', '')
+  $Version     = Get-AppVersion $app
+
+  foreach($as in $assigns){
+    $t = $as.target
+    $tType = ($t.'@odata.type' -replace '^#?microsoft\.graph\.', '')
+    $targetKind = $null; $targetId = $null
+
+    # תרגום כל הווריאציות ליעד קריא
+    switch -Regex ($tType){
+      '^all(Licensed)?UsersAssignmentTarget$'     { $targetKind = 'All Users' }
+      '^all(Licensed)?DevicesAssignmentTarget$'   { $targetKind = 'All Devices' }
+      '^groupAssignmentTarget$'                   { $targetKind = 'Group Include';  $targetId = $t.groupId; if($targetId){ [void]$groupIds.Add($targetId) } }
+      '^exclusionGroupAssignmentTarget$'          { $targetKind = 'Group Exclude';  $targetId = $t.groupId; if($targetId){ [void]$groupIds.Add($targetId) } }
+      default                                     { $targetKind = $tType }
+    }
+
+    $rows.Add([pscustomobject]@{
+      AppDisplayName = $app.displayName
+      Platform       = $AppPlatform
+      AppType        = $AppType
+      Publisher      = $app.publisher
+      Version        = $Version
+      AppId          = $app.id
+      Intent         = $as.intent                       # available / required / uninstall / availableWithoutEnrollment
+      TargetKind     = $targetKind                      # All Users / All Devices / Group Include / Group Exclude
+      GroupId        = $targetId
+      GroupName      = $null                            # נמלא בהמשך
+      FilterMode     = $as.filterType                   # include / exclude / None
+      FilterId       = $as.filterId
+      FilterName     = $( if($as.filterId -and $filterMap.ContainsKey($as.filterId)) { $filterMap[$as.filterId] } else { $null } )
+    }) | Out-Null
+  }
+}
+
+# 4) רזולוציית שמות לקבוצות (עמיד לטיפוס)
+$idsRaw   = $groupIds
+$idsArray = @()
+if ($idsRaw -is [System.Collections.Generic.HashSet[string]]) { $idsArray = $idsRaw.ToArray() }
+elseif ($idsRaw -is [array]) { $idsArray = $idsRaw }
+elseif ($idsRaw) { $idsArray = @($idsRaw) }
+
+if($idsArray.Count -gt 0){
+  $nameMap = @{}
+  $batch = 100
+  for($i=0; $i -lt $idsArray.Count; $i += $batch){
+    $chunk = $idsArray[$i..([math]::Min($i+$batch-1,$idsArray.Count-1))]
+    $body = @{ ids = $chunk; types = @("group") } | ConvertTo-Json
+    try{
+      $resp = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/directoryObjects/getByIds" -Body $body -ContentType "application/json"
+      foreach($o in ($resp.value ?? @())){
+        if($o.'@odata.type' -match 'group' -and $o.id){ $nameMap[$o.id] = $o.displayName }
+      }
+    } catch { Write-Warning "getByIds failed: $($_.Exception.Message)" }
+  }
+  foreach($r in $rows){
+    if($r.GroupId){ $r.GroupName = $( if($nameMap.ContainsKey($r.GroupId)) { $nameMap[$r.GroupId] } else { $r.GroupId } ) }
+    elseif($r.TargetKind -in @('All Users','All Devices')){ $r.GroupName = $r.TargetKind }
+  }
+} else {
+  foreach($r in $rows){
+    if($r.TargetKind -in @('All Users','All Devices')){ $r.GroupName = $r.TargetKind }
+  }
+}
+
+# עמודה ידידותית לתצוגה (שם קבוצה או All Users/Devices)
+foreach($r in $rows){
+  $r | Add-Member -NotePropertyName TargetDisplay -NotePropertyValue ($r.GroupName ? $r.GroupName : $r.TargetKind) -Force
+}
+
+if($rows.Count -eq 0){
+  Write-Warning "לא נמצאו אפליקציות או הקצאות."
+  return
+}
+
+# 5) כתיבה לאקסל (מוחק קובץ קודם אם קיים)
+$null = Remove-Item -Path $OutXlsx -ErrorAction SilentlyContinue
+
+# גיליון 1: כל ההקצאות
+$rows | Export-Excel -Path $OutXlsx -WorksheetName 'Assignments' -TableName 'Assignments' `
+  -AutoSize -AutoFilter -BoldTopRow -FreezeTopRow
+
+# גיליון 2: סיכום לפי אפליקציה
+$summaryApp = $rows |
+  Group-Object AppDisplayName, Platform |
+  ForEach-Object {
+    [pscustomobject]@{
+      AppDisplayName = $_.Group[0].AppDisplayName
+      Platform       = $_.Group[0].Platform
+      Assignments    = $_.Count
+      Intents        = (($_.Group | Select-Object -Expand Intent | Sort-Object -Unique) -join ', ')
+      Targets        = (($_.Group | Select-Object -Expand TargetKind | Sort-Object -Unique) -join ', ')
+    }
+  }
+$summaryApp | Export-Excel -Path $OutXlsx -WorksheetName 'SummaryByApp' -TableName 'SummaryByApp' `
+  -AutoSize -AutoFilter -BoldTopRow -FreezeTopRow -ClearSheet
+
+# גיליון 3: סיכום לפי יעד/קבוצה
+$summaryTarget = $rows |
+  Group-Object TargetKind, GroupName |
+  ForEach-Object {
+    [pscustomobject]@{
+      TargetKind  = $_.Group[0].TargetKind
+      GroupName   = $_.Group[0].GroupName
+      AppsCount   = ($_.Group | Select-Object -Expand AppDisplayName -Unique).Count
+      Intents     = (($_.Group | Select-Object -Expand Intent | Sort-Object -Unique) -join ', ')
+    }
+  }
+$summaryTarget | Export-Excel -Path $OutXlsx -WorksheetName 'SummaryByTarget' -TableName 'SummaryByTarget' `
+  -AutoSize -AutoFilter -BoldTopRow -FreezeTopRow -ClearSheet
+
+Write-Host "Done. Excel saved to: $OutXlsx"
