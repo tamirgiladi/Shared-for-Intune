@@ -1,12 +1,13 @@
 
 Connect-MgGraph -Scopes "DeviceManagementApps.Read.All","User.Read.All","Group.Read.All","Directory.Read.All"
 
-$TenantId = "<YOUR-TENANT-GUID>"
-$ClientId = "<YOUR-APP-CLIENT-ID>"
-$Sec = ConvertTo-SecureString "<CLIENT-SECRET-VALUE>" -AsPlainText -Force
+$TenantId = "<YOUR-TENANT-GUID>"   # או שם דומיין כמו contoso.onmicrosoft.com
+Connect-MgGraph -TenantId $TenantId -UseDeviceCode -Scopes `
+  "DeviceManagementApps.Read.All","DeviceManagementConfiguration.Read.All","Directory.Read.All"
 
-Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -ClientSecret $Sec
-Get-MgContext
+Get-MgContext | Select Account,TenantId,Scopes
+# בדיקת קריאה לדוגמה (אפליקציות אינטיון)
+Get-MgDeviceAppMgtMobileApp -Top 1 | Select-Object id,displayName
 
 
 
